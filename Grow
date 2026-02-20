@@ -1,0 +1,234 @@
+import time
+import os
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+from growwapi import GrowwAPI
+
+# =====================================
+# LOAD API KEYS SAFELY
+# =====================================
+
+API_KEY = "eyJraWQiOiJaTUtjVXciLCJhbGciOiJFUzI1NiJ9.eyJleHAiOjI1NTk5ODE3MTIsImlhdCI6MTc3MTU4MTcxMiwibmJmIjoxNzcxNTgxNzEyLCJzdWIiOiJ7XCJ0b2tlblJlZklkXCI6XCIyYmQwNTA3OS1lMWNlLTQ5MjctYmU1ZS1kNTUxYjcwNTdkYWVcIixcInZlbmRvckludGVncmF0aW9uS2V5XCI6XCJlMzFmZjIzYjA4NmI0MDZjODg3NGIyZjZkODQ5NTMxM1wiLFwidXNlckFjY291bnRJZFwiOlwiMzczM2NjNTMtMGY4ZS00NWM4LWIzYTAtNDdkN2UxMTUzN2Q2XCIsXCJkZXZpY2VJZFwiOlwiMzM5NjNhNzItZGMwZS01NDI4LWFjYTQtNDNlY2E0ZGMzODIwXCIsXCJzZXNzaW9uSWRcIjpcImZiNDdkZWUwLTAwNzYtNDViNi1hOTgzLTY3NzE5NjcwMjM4ZlwiLFwiYWRkaXRpb25hbERhdGFcIjpcIno1NC9NZzltdjE2WXdmb0gvS0EwYkhWUG9xSHYwRGowT2MyNWE0cTQ0dk5STkczdTlLa2pWZDNoWjU1ZStNZERhWXBOVi9UOUxIRmtQejFFQisybTdRPT1cIixcInJvbGVcIjpcImF1dGgtdG90cFwiLFwic291cmNlSXBBZGRyZXNzXCI6XCIxMDMuODguMTAyLjIzNywxNzIuNzAuMjE5LjI1LDM1LjI0MS4yMy4xMjNcIixcInR3b0ZhRXhwaXJ5VHNcIjoyNTU5OTgxNzEyNTM3fSIsImlzcyI6ImFwZXgtYXV0aC1wcm9kLWFwcCJ9.7UJlX-5iaGk7AfBrNLlJgFX7L4Tc9hHr-ShPnnf7-_hnqa5Bf4ogXs0jboaQytqtwMbf0dDiRK57A8RYZTGWQg"
+SECRET = "-d84oNF$JxnotRn6tu(9i*M8_Ip1TdG%"
+
+if not API_KEY or not SECRET:
+    raise Exception("❌ API keys not set in environment variables.")
+
+CAPITAL = 9700
+REFRESH_SECONDS = 5
+SL_BUFFER = 5
+
+# =====================================
+# AUTHENTICATION
+# =====================================
+
+access_token = GrowwAPI.get_access_token(api_key=API_KEY, secret=SECRET)
+groww = GrowwAPI(access_token)
+
+print("✅ Connected to Groww API")
+
+# =====================================
+# INDEX CONFIG
+# =====================================
+
+INDEX_CONFIG = {
+    "NIFTY": {
+        "symbol": "NIFTY",
+        "strike_step": 50,
+        "lot_size": 50
+    },
+    "BANKNIFTY": {
+        "symbol": "BANKNIFTY",
+        "strike_step": 100,
+        "lot_size": 15
+    }
+}
+
+# =====================================
+# GLOBAL VARIABLES
+# =====================================
+
+opening_price = None
+price_930 = None
+range_high = None
+range_low = None
+range_locked = False
+
+# =====================================
+# FETCH LIVE SPOT
+# =====================================
+
+def get_spot(symbol):
+    quote = groww.get_quote(
+        symbol,
+        groww.EXCHANGE_NSE
+    )
+    return float(quote["ltp"])
+
+# =====================================
+# FETCH HISTORICAL DAILY DATA
+# =====================================
+
+def get_daily_data(symbol):
+
+    today = datetime.now()
+    past = today - timedelta(days=60)
+
+    data = groww.get_historical_candles(
+        symbol,                      # trading_symbol
+        groww.EXCHANGE_NSE,          # exchange
+        groww.SEGMENT_CASH,          # segment (IMPORTANT)
+        past.strftime("%Y-%m-%d"),   # from_date
+        today.strftime("%Y-%m-%d"),  # to_date
+        "day"                        # candle_interval
+    )
+
+    df = pd.DataFrame(data)
+
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['close'] = df['close'].astype(float)
+    df['volume'] = df['volume'].astype(float)
+
+    return df
+
+
+# =====================================
+# ATR CALCULATION
+# =====================================
+
+def calculate_atr(df, period=14):
+    df['tr'] = np.maximum(
+        df['high'] - df['low'],
+        np.maximum(
+            abs(df['high'] - df['close'].shift(1)),
+            abs(df['low'] - df['close'].shift(1))
+        )
+    )
+    return df['tr'].rolling(period).mean().iloc[-1]
+
+# =====================================
+# NEXT DAY OPEN PROJECTION
+# =====================================
+
+def project_next_open(symbol):
+
+    df = get_daily_data(symbol)
+
+    last_close = df['close'].iloc[-1]
+    prev_close = df['close'].iloc[-2]
+    atr = calculate_atr(df)
+
+    bias = "BULLISH" if last_close > prev_close else "BEARISH"
+    gap_projection = atr * 0.25
+
+    if bias == "BULLISH":
+        projected_open = last_close + gap_projection
+    else:
+        projected_open = last_close - gap_projection
+
+    upper_zone = projected_open + (atr * 0.1)
+    lower_zone = projected_open - (atr * 0.1)
+
+    return {
+        "last_close": round(last_close,2),
+        "atr": round(atr,2),
+        "bias": bias,
+        "projected_open": round(projected_open,2),
+        "zone_low": round(lower_zone,2),
+        "zone_high": round(upper_zone,2)
+    }
+
+# =====================================
+# MAIN LIVE LOOP
+# =====================================
+
+def run(index):
+
+    global opening_price, price_930
+    global range_high, range_low, range_locked
+
+    config = INDEX_CONFIG[index]
+    projection = project_next_open(config["symbol"])
+
+    while True:
+        try:
+            os.system("cls" if os.name == "nt" else "clear")
+
+            now = datetime.now()
+            current_time = now.strftime("%H:%M")
+
+            spot = get_spot(config["symbol"])
+
+            # Capture 9:15 open
+            if current_time == "09:15" and opening_price is None:
+                opening_price = spot
+
+            # Track range 9:15–9:30
+            if "09:15" <= current_time <= "09:30":
+                if range_high is None or spot > range_high:
+                    range_high = spot
+                if range_low is None or spot < range_low:
+                    range_low = spot
+
+            # Lock range
+            if current_time >= "09:30" and not range_locked:
+                price_930 = spot
+                range_locked = True
+
+            buy_above = None
+            sell_below = None
+            target_up = None
+            target_down = None
+
+            if range_locked:
+                buy_above = range_high + SL_BUFFER
+                sell_below = range_low - SL_BUFFER
+                range_size = range_high - range_low
+                target_up = buy_above + (range_size * 1.5)
+                target_down = sell_below - (range_size * 1.5)
+
+            # DISPLAY
+            print("===========================================")
+            print(f"Index              : {index}")
+            print(f"Live Spot          : {spot}")
+            print("-------------------------------------------")
+            print("📊 NEXT DAY PROJECTION")
+            print(f"Last Close         : {projection['last_close']}")
+            print(f"ATR (14)           : {projection['atr']}")
+            print(f"Bias               : {projection['bias']}")
+            print(f"Projected Open     : {projection['projected_open']}")
+            print(f"Opening Zone       : {projection['zone_low']} - {projection['zone_high']}")
+            print("-------------------------------------------")
+            print("📈 TODAY INTRADAY LEVELS")
+            print(f"Opening (9:15)     : {opening_price}")
+            print(f"9:30 Price         : {price_930}")
+            print(f"Range High         : {range_high}")
+            print(f"Range Low          : {range_low}")
+
+            if range_locked:
+                print("-------------------------------------------")
+                print(f"BUY ABOVE          : {buy_above}")
+                print(f"TARGET UP          : {target_up}")
+                print("")
+                print(f"SELL BELOW         : {sell_below}")
+                print(f"TARGET DOWN        : {target_down}")
+            else:
+                print("⏳ Waiting for 9:30 range lock...")
+
+            print("===========================================")
+
+            time.sleep(REFRESH_SECONDS)
+
+        except Exception as e:
+            print("API Error:", e)
+            time.sleep(5)
+
+# =====================================
+# START
+# =====================================
+
+if __name__ == "__main__":
+    idx = input("Index (NIFTY/BANKNIFTY): ").upper()
+    run(idx)
